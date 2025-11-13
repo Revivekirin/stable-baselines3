@@ -199,6 +199,7 @@ class ReplayBuffer(BaseBuffer):
     rewards: np.ndarray
     dones: np.ndarray
     timeouts: np.ndarray
+    infos: dict[str, np.ndarray]
 
     def __init__(
         self,
@@ -266,6 +267,8 @@ class ReplayBuffer(BaseBuffer):
                     "This system does not have apparently enough memory to store the complete "
                     f"replay buffer {total_memory_usage:.2f}GB > {mem_available:.2f}GB"
                 )
+        
+        self.infos = {}
 
     def add(
         self,
@@ -303,6 +306,8 @@ class ReplayBuffer(BaseBuffer):
 
         if self.handle_timeout_termination:
             self.timeouts[self.pos] = np.array([info.get("TimeLimit.truncated", False) for info in infos])
+        
+        
 
         self.pos += 1
         if self.pos == self.buffer_size:
