@@ -167,7 +167,6 @@ class FQL(OffPolicyAlgorithm):
 
         for step in range(gradient_steps):
             rb = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
-            print("[DEBUG] rb :", rb)
             s = th.as_tensor(rb.observations, device=self.device, dtype=th.float32)
             s2 = th.as_tensor(rb.next_observations, device=self.device, dtype=th.float32)
             r = th.as_tensor(rb.rewards, device=self.device, dtype=th.float32).squeeze(-1)
