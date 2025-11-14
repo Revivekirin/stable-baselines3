@@ -22,6 +22,32 @@ LOG_STD_MAX = 2
 LOG_STD_MIN = -20
 
 
+# --- Custom Flow Network Module ---
+class FlowNetwork(nn.Module):
+    """
+    Flow network that takes (obs_features, z) and outputs z'.
+    Wraps Sequential to handle multiple inputs.
+    """
+    def __init__(self, mlp: nn.Sequential):
+        super().__init__()
+        self.mlp = mlp
+    
+    def forward(self, obs_features: th.Tensor, z: th.Tensor) -> th.Tensor:
+        """
+        Args:
+            obs_features: (B, obs_dim) - observation features
+            z: (B, z_dim) - latent noise
+        Returns:
+            z': (B, z_dim) - steered latent
+        """
+        # Concatenate obs and z
+        x = th.cat([obs_features, z], dim=-1)
+        # Pass through MLP to get residual
+        delta_z = self.mlp(x)
+        # Return steered latent (residual connection)
+        return z + delta_z
+
+
 # --- New: LatentFQLPolicy ------------------------------------
 class LatentFQLPolicy(BasePolicy):
     """
@@ -32,6 +58,7 @@ class LatentFQLPolicy(BasePolicy):
     Usage:
         model = FQL("LatentFQLPolicy", env, z_dim=32, ...)
     """
+                 
     
     def __init__(
         self,
@@ -50,6 +77,8 @@ class LatentFQLPolicy(BasePolicy):
         share_features_extractor: bool = False,
         post_linear_modules: Optional[list[type[nn.Module]]] = None,
         features_dim: Optional[int] = None,  
+        flow_steps: int = 1,
+        flow_step_size: float = 1.0,
     ):
         super().__init__(
             observation_space,
@@ -71,14 +100,17 @@ class LatentFQLPolicy(BasePolicy):
         if net_arch is None:
             net_arch = [256, 256]
         if isinstance(net_arch, dict):
-            self.flow_arch = net_arch.get("flow", [256, 256])
-            self.q_arch    = net_arch.get("q",    [256, 256])
+            self.flow_arch = net_arch.get("pi", [256, 256])  # Use 'pi' key for flow
+            self.q_arch    = net_arch.get("qf", [256, 256])  # Use 'qf' key for Q
         else:
             self.flow_arch = self.q_arch = net_arch
         self.net_arch = net_arch
 
+        self.flow_steps = flow_steps
+        self.flow_step_size = flow_step_size
+
         self._build_networks(lr_schedule)
-        
+
     def _build_networks(self, lr_schedule: Schedule) -> None:
         fe_kwargs = self.features_extractor_kwargs or {}
         self.features_extractor = self.features_extractor_class(
@@ -92,7 +124,8 @@ class LatentFQLPolicy(BasePolicy):
                 "features_extractor must define .features_dim"
             self.features_dim = int(self.features_extractor.features_dim)
 
-        self.flow_net = nn.Sequential(
+        # Flow network: outputs residual delta_z (FIXED: wrapped in custom module)
+        flow_mlp = nn.Sequential(
             *create_mlp(
                 self.features_dim + self.z_dim,
                 self.z_dim,
@@ -100,8 +133,19 @@ class LatentFQLPolicy(BasePolicy):
                 self.activation_fn,
                 post_linear_modules=self.post_linear_modules,
             )
-        ).to(self.device)
+        )
+        
+        # 🔥 FIX: Initialize last layer with small weights
+        if len(flow_mlp) > 0:
+            last_layer = flow_mlp[-1]
+            if isinstance(last_layer, nn.Linear):
+                nn.init.uniform_(last_layer.weight, -1e-3, 1e-3)
+                nn.init.zeros_(last_layer.bias)
+        
+        # Wrap in FlowNetwork to handle (obs_features, z) inputs
+        self.flow_net = FlowNetwork(flow_mlp).to(self.device)
 
+        # Q-network
         self.q_net = nn.Sequential(
             *create_mlp(
                 self.features_dim + self.z_dim,
@@ -111,7 +155,15 @@ class LatentFQLPolicy(BasePolicy):
                 post_linear_modules=self.post_linear_modules,
             )
         ).to(self.device)
+        
+        # 🔥 FIX: Q-network initialization
+        if len(self.q_net) > 0:
+            last_layer = self.q_net[-1]
+            if isinstance(last_layer, nn.Linear):
+                nn.init.uniform_(last_layer.weight, -3e-3, 3e-3)
+                nn.init.uniform_(last_layer.bias, -3e-3, 3e-3)
 
+        # Target network (hard copy)
         self.q_target = nn.Sequential(
             *create_mlp(
                 self.features_dim + self.z_dim,
@@ -123,29 +175,86 @@ class LatentFQLPolicy(BasePolicy):
         ).to(self.device)
         self.q_target.load_state_dict(self.q_net.state_dict())
         self.q_target.eval()
+        for p in self.q_target.parameters():
+            p.requires_grad_(False)
 
+        # Optimizers
         opt_kwargs = self.optimizer_kwargs or {}
-        self.flow_optimizer = self.optimizer_class(self.flow_net.parameters(),
-                                                lr=lr_schedule(1), **opt_kwargs)
-        self.q_optimizer    = self.optimizer_class(self.q_net.parameters(),
-                                                lr=lr_schedule(1), **opt_kwargs)
+        self.flow_optimizer = self.optimizer_class(
+            self.flow_net.parameters(),
+            lr=lr_schedule(1), 
+            **opt_kwargs
+        )
+        self.q_optimizer = self.optimizer_class(
+            self.q_net.parameters(),
+            lr=lr_schedule(1), 
+            **opt_kwargs
+        )
 
+    def flow_forward(self, obs: th.Tensor, z: th.Tensor) -> th.Tensor:
+        """
+        Flow forward pass: s, z -> z'
+        
+        Args:
+            obs: (B, obs_dim) raw observations
+            z: (B, z_dim) latent noise
+        Returns:
+            z': (B, z_dim) steered latent
+        """
+        # Extract features (no_grad to save memory during action sampling)
+        with th.no_grad():
+            features = self.extract_features(obs, self.features_extractor)
+        
+        z_cur = z
+        for _ in range(self.flow_steps):
+            delta = self.flow_net(features, z)
+            z_cur = z_cur + self.flow_step_size * delta
+        
+        return z_cur
+
+    def q_forward(self, obs: th.Tensor, z: th.Tensor, use_target: bool = False) -> th.Tensor:
+        """
+        Q-function forward pass: s, z -> Q(s,z)
+        
+        Args:
+            obs: (B, obs_dim)
+            z: (B, z_dim)
+            use_target: if True, use target network
+        Returns:
+            q_values: (B,)
+        """
+        with th.no_grad():
+            features = self.features_extractor(obs)
+        
+        x = th.cat([features, z], dim=-1)
+        
+        if use_target:
+            q_val = self.q_target(x).squeeze(-1)
+        else:
+            q_val = self.q_net(x).squeeze(-1)
+        
+        return q_val
+
+    def update_target_network(self, tau: float) -> None:
+        """Soft update of target Q-network"""
+        for param, target_param in zip(self.q_net.parameters(), self.q_target.parameters()):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+
+    def forward(self, obs: th.Tensor, deterministic: bool = False) -> th.Tensor:
+        """
+        Standard forward pass (for compatibility with BasePolicy).
+        Not used in FQL training loop.
+        """
+        raise NotImplementedError("Use flow_forward() and q_forward() instead")
+
+    def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> th.Tensor:
+        """Not used in FQL"""
+        raise NotImplementedError("Use flow_forward() instead")
     
+
     def _param_device(self):
         return next(self.flow_net.parameters()).device
-
-    def flow_forward(self, obs: PyTorchObs, z: th.Tensor) -> th.Tensor:
-        dev = self._param_device()
-        if not isinstance(obs, th.Tensor):
-            obs = th.as_tensor(obs)
-        if not isinstance(z, th.Tensor):
-            z = th.as_tensor(z)
-        obs = obs.to(dev)
-        z   = z.to(dev)
-
-        feat  = self.extract_features(obs, self.features_extractor)
-        delta = self.flow_net(th.cat([feat, z], dim=-1))
-        return z + delta
+    
 
     def q_forward(self, obs: PyTorchObs, z: th.Tensor, use_target: bool = False) -> th.Tensor:
         dev = self._param_device()
@@ -214,6 +323,8 @@ class LatentFQLPolicy(BasePolicy):
                 optimizer_kwargs=self.optimizer_kwargs,
                 post_linear_modules=self.post_linear_modules,
                 features_dim=self.features_dim,
+                flow_steps=self.flow_steps,
+                flow_step_size=self.flow_step_size,
             )
         )
         return data

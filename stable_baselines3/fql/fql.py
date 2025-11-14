@@ -71,7 +71,6 @@ class FQL(OffPolicyAlgorithm):
 		seed: Optional[int] = None,
 		device: Union[th.device, str] = "auto",
 		_init_setup_model: bool = True,
-		actor_gradient_steps: int = -1,
 		diffusion_policy=None,
 		diffusion_act_dim=None,
 		noise_critic_grad_steps: int = 1,
@@ -113,12 +112,10 @@ class FQL(OffPolicyAlgorithm):
         self.diffusion_policy = diffusion_policy
         self.diffusion_act_chunk = diffusion_act_dim[0]
         self.diffusion_act_dim = diffusion_act_dim[1]
+        self.train_freq = train_freq
 
         if _init_setup_model:
             self._setup_model()
-        
-        self._last_latent = None
-
 
     # -------------------------------------------------------------------------
     # Setup
@@ -126,19 +123,19 @@ class FQL(OffPolicyAlgorithm):
     def _setup_model(self) -> None:
         super()._setup_model()
         assert isinstance(self.policy, LatentFQLPolicy)
-        self.q_target = deepcopy(self.policy.q_net).to(self.device)
-        for p in self.q_target.parameters():
-            p.requires_grad_(False)
 
     def _create_aliases(self) -> None:
         pass
 
     # -------------------------------------------------------------------------
-    # Training Loop
+    # Training Loop (Fixed version)
     # -------------------------------------------------------------------------
-
     def train(self, gradient_steps: int, batch_size: int = 256) -> None:
         self.policy.set_training_mode(True)
+
+        # 통계 수집용
+        q_losses, flow_losses, q_values, target_q_values = [], [], [], []
+        delta_norms, reg_values = [], []
 
         for step in range(gradient_steps):
             rb = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
@@ -147,90 +144,169 @@ class FQL(OffPolicyAlgorithm):
             r = th.as_tensor(rb.rewards, device=self.device, dtype=th.float32).squeeze(-1)
             d = th.as_tensor(rb.dones, device=self.device, dtype=th.float32).squeeze(-1)
 
-            # ===== Sample latent actions from info =====
-            #TODO
-            zb_np = rb.infos.get('latent', None)
-            assert zb_np is not None, "[FQL] Latent actions not found in replay buffer infos."
-            zb = th.as_tensor(zb_np, device=self.device, dtype=th.float32)
-
-            # ===== Critic TD Target =====
+            # ===== 1. Critic Update =====
+            z = th.randn(batch_size, self.policy.z_dim, device=self.device)
+            q_pred = self.policy.q_forward(s, z)
+            
+            # TD Target 계산
             with th.no_grad():
                 z2 = th.randn(batch_size, self.policy.z_dim, device=self.device)
                 z2p = self.policy.flow_forward(s2, z2)
-                y = r + (1 - d) * self.gamma * self.policy.q_forward(s2, z2p, use_target=True)
-
-            # ===== Critic Loss =====
-            q_pred = self.policy.q_forward(s, zb)
-            loss_q = F.mse_loss(q_pred, y)
+                
+                # Target Q-value clipping (CRITICAL)
+                target_q = self.policy.q_forward(s2, z2p, use_target=True)
+                target_q = th.clamp(target_q, -100, 100)
+                y = r + (1 - d) * self.gamma * target_q
+                y = th.clamp(y, -100, 100)
+            
+            # Huber Loss (outlier 저항성)
+            loss_q = F.smooth_l1_loss(q_pred, y)
+            
             self.policy.q_optimizer.zero_grad(set_to_none=True)
             loss_q.backward()
+            th.nn.utils.clip_grad_norm_(self.policy.q_net.parameters(), max_norm=1.0)
             self.policy.q_optimizer.step()
+            
+            q_losses.append(loss_q.item())
+            q_values.append(q_pred.mean().item())
+            target_q_values.append(target_q.mean().item())
+            
+            for _ in range(self.train_freq if isinstance(self.train_freq, int) else 1):
+                # ===== 2. Flow Update =====
+                # Q network gradient 비활성화 (안정화)
+                for p in self.policy.q_net.parameters():
+                    p.requires_grad_(False)
+                
+                z_fresh = th.randn(batch_size, self.policy.z_dim, device=self.device)
+                zp = self.policy.flow_forward(s, z_fresh)
+                qv = self.policy.q_forward(s, zp)
+                
+                # Regularization
+                reg = (zp - z_fresh).pow(2).mean()
+                
+                # Q-value normalization (CRITICAL for stability)
+                denom = qv.abs().mean().detach() + 1e-6
+                qv_normalized = qv / denom
+                loss_flow = (-qv_normalized).mean() + self.policy.alpha * reg
+                
+                self.policy.flow_optimizer.zero_grad(set_to_none=True)
+                loss_flow.backward()
+                th.nn.utils.clip_grad_norm_(self.policy.flow_net.parameters(), max_norm=0.5)
+                self.policy.flow_optimizer.step()
+                
+                # Q network gradient 재활성화
+                for p in self.policy.q_net.parameters():
+                    p.requires_grad_(True)
+                
+                flow_losses.append(loss_flow.item())
+                delta_norms.append((zp - z_fresh).norm(dim=-1).mean().item())
+                reg_values.append(reg.item())
 
-            # ===== Flow Update =====
-            z = th.randn(batch_size, self.policy.z_dim, device=self.device)
-            zp = self.policy.flow_forward(s, z)
-            qv = self.policy.q_forward(s, zp)
-            reg = (zp - z).pow(2).mean()
-            loss_flow = (-qv).mean() + self.policy.alpha * reg
-            self.policy.flow_optimizer.zero_grad(set_to_none=True)
-            loss_flow.backward()
-            self.policy.flow_optimizer.step()
-
-            # ===== Target Update =====
-            polyak_update(self.policy.q_net.parameters(), self.q_target.parameters(), self.tau)
+            # ===== 3. Target Network Update =====
+            if step % self.target_update_interval == 0:
+                self.policy.update_target_network(self.tau)
 
             # ===== Debug Logging =====
-            if step % 10 == 0:
-                delta_norm = (zp - z).norm(dim=-1).mean().item()
-                q_mean, q_std = q_pred.mean().item(), q_pred.std().item()
+            if step % 100 == 0 and self.verbose > 0:
                 print(
-                    f"[FQL Debug] step={step:03d} | "
+                    f"[FQL] step={step:04d} | "
                     f"loss_q={loss_q.item():.4f} | loss_flow={loss_flow.item():.4f} | "
-                    f"Δz_norm={delta_norm:.3f} | Qμ={q_mean:.3f}±{q_std:.3f}"
+                    f"Δz={delta_norms[-1]:.3f} | Q={q_values[-1]:.2f} | "
+                    f"target_Q={target_q_values[-1]:.2f} | R={r.mean().item():.3f}"
                 )
 
+        # Epoch 통계 (DSRL 스타일)
         self._n_updates += gradient_steps
-
+        
+        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        self.logger.record("train/q_loss", np.mean(q_losses))
+        self.logger.record("train/flow_loss", np.mean(flow_losses))
+        self.logger.record("train/q_value", np.mean(q_values))
+        self.logger.record("train/target_q_value", np.mean(target_q_values))
+        self.logger.record("train/delta_z_norm", np.mean(delta_norms))
+        self.logger.record("train/regularization", np.mean(reg_values))
 
     # -------------------------------------------------------------------------
-    # Action sampling
+    # Action Sampling (DSRL-compatible)
     # -------------------------------------------------------------------------
-    def _act_from_latent(self, obs_tensor: th.Tensor) -> np.ndarray:
+    def _act_from_latent(self, obs_tensor: th.Tensor) -> tuple:
+        """
+        DSRL 스타일 action generation
+        """
         B = obs_tensor.shape[0]
-        z = th.randn(B, self.policy.z_dim, device=self.device) # TODO:latent critic Q와 동일한 z 사용하도록
-        zp = self.policy.flow_forward(obs_tensor, z).detach()
-        a = self.diffusion_policy(
-            obs_tensor,
-            zp.view(B, 1, -1),  # (B, Ta, Dz)
-            return_numpy=False,
-        )
-        a  = a.view(B, self.diffusion_act_chunk, self.diffusion_act_dim)
-        return a.cpu().numpy(), zp
+        
+        # 1. Sample latent noise
+        z = th.randn(B, self.policy.z_dim, device=self.device)
+        
+        with th.no_grad():
+            # 2. Flow steering
+            zp = self.policy.flow_forward(obs_tensor, z)
+            # Latent clipping
+            zp = th.clamp(zp, -5, 5)
+        
+        # 3. Reshape for diffusion policy (DSRL pattern)
+        zp_input = zp.reshape(B, self.diffusion_act_chunk, self.diffusion_act_dim)
+        
+        # 4. Decode through frozen diffusion policy
+        try:
+            diffused_action = self.diffusion_policy(
+                obs_tensor,
+                zp_input,
+                return_numpy=False,
+            )
+            diffused_action = diffused_action.reshape(B, self.diffusion_act_chunk * self.diffusion_act_dim)
+        except Exception as e:
+            print(f"[ERROR] Diffusion decode failed: {e}")
+            print(f"  obs: {obs_tensor.shape}, zp_input: {zp_input.shape}")
+            raise
+        
+        action = diffused_action.cpu().numpy()
+        return action, zp
 
     def _sample_action(
         self,
         learning_starts: int,
         action_noise: Optional[ActionNoise] = None,
         n_envs: int = 1,
-    ):
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        DSRL-style action sampling
+        """
         assert self._last_obs is not None
-        obs = th.as_tensor(self._last_obs, device=self.device, dtype=th.float32)
-        action, zprime = self._act_from_latent(obs)
-        self._last_latent = zprime.detach().cpu().numpy()
-        print("[FQL] Sampled latent:", self._last_latent)
+        
+        # Warmup: random action through diffusion
+        if self.num_timesteps < learning_starts:
+            unscaled_action = np.array([self.action_space.sample() for _ in range(n_envs)])
+            
+            action_tensor = th.as_tensor(unscaled_action, device=self.device, dtype=th.float32)
+            obs_tensor = th.as_tensor(self._last_obs, device=self.device, dtype=th.float32)
+            
+            action_reshaped = action_tensor.reshape(n_envs, self.diffusion_act_chunk, self.diffusion_act_dim)
+            with th.no_grad():
+                diffused_action = self.diffusion_policy(obs_tensor, action_reshaped, return_numpy=False)
+            diffused_action = diffused_action.reshape(n_envs, self.diffusion_act_chunk * self.diffusion_act_dim)
+            action = diffused_action.cpu().numpy()
+        else:
+            # Training: use flow policy
+            obs = th.as_tensor(self._last_obs, device=self.device, dtype=th.float32)
+            action, _ = self._act_from_latent(obs)
+        
         buffer_action = action
         return action, buffer_action
 
     def predict_diffused(
         self,
-        observation,
-        state=None,
-        episode_start=None,
-        deterministic=False,
-    ):
+        observation: Union[np.ndarray, dict[str, np.ndarray]],
+        state: Optional[tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> tuple[np.ndarray, Optional[tuple[np.ndarray, ...]]]:
+        """
+        DSRL-style prediction for evaluation
+        """
         obs = th.as_tensor(observation, device=self.device, dtype=th.float32)
-        action_chunked, _ = self._act_from_latent(obs)
-        return action_chunked, state
+        action, _ = self._act_from_latent(obs)
+        return action, state
 
     # -------------------------------------------------------------------------
     # Learning Wrapper
@@ -254,7 +330,7 @@ class FQL(OffPolicyAlgorithm):
         )
 
     # -------------------------------------------------------------------------
-    # Saving / Loading
+    # Saving / Loading (DSRL-style)
     # -------------------------------------------------------------------------
     def _excluded_save_params(self) -> list[str]:
         return super()._excluded_save_params()
