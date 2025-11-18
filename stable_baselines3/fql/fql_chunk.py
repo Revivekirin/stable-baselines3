@@ -12,12 +12,12 @@ from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import polyak_update
-from stable_baselines3.fql.policies import LatentFQLPolicy
+from stable_baselines3.fql.policies import CKLatentFQLPolicy
 
-SelfFQL = TypeVar("SelfFQL", bound="FQL")
+SelfCKFQL = TypeVar("SelfCkFQL", bound="CKFQL")
 
 
-class FQL(OffPolicyAlgorithm):
+class CKFQL(OffPolicyAlgorithm):
     """
     Latent-space Flow Q-Learning with Offline/Online phases.
     - Offline: Train flow model with offline data
@@ -25,15 +25,17 @@ class FQL(OffPolicyAlgorithm):
     """
 
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
-        "LatentFQLPolicy": LatentFQLPolicy,
-        "MlpLatentFQLPolicy": LatentFQLPolicy,
+        # "LatentFQLPolicy" : LatentFQLPolicy,
+        # "MlpLatentFQLPolicy": LatentFQLPolicy,
+        "CKLatentFQLPolicy": CKLatentFQLPolicy,
+        "MlpCKLatentFQLPolicy" : CKLatentFQLPolicy,
     }
 
-    policy: LatentFQLPolicy
+    policy: CKLatentFQLPolicy
 
     def __init__(
         self,
-        policy: Union[str, type[LatentFQLPolicy]],
+        policy: Union[str, type[CKLatentFQLPolicy]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule] = 3e-4,
         buffer_size: int = 1_000_000,
@@ -111,6 +113,7 @@ class FQL(OffPolicyAlgorithm):
         self.target_update_interval = target_update_interval
         self.diffusion_policy = diffusion_policy
         self.diffusion_act_chunk = diffusion_act_dim[0]
+        print("[DEBUG] dppo output action dimension: ", self.diffusion_act_chunk)
         self.diffusion_act_dim = diffusion_act_dim[1]
 
         # Offline/Online phase control
@@ -127,10 +130,53 @@ class FQL(OffPolicyAlgorithm):
 
     def _setup_model(self) -> None:
         super()._setup_model()
-        assert isinstance(self.policy, LatentFQLPolicy)
+        assert isinstance(self.policy, CKLatentFQLPolicy)
+
+        assert self.policy.z_dim % self.diffusion_act_chunk == 0, \
+            "policy.z_dim must be divisible by diffusion_act_chunk for chunked latent."
+        self.latent_step_dim = self.policy.z_dim // self.diffusion_act_chunk
+
 
     def _create_aliases(self) -> None:
         pass
+
+    # -------------------------------------------------------------------------
+    # QC-FQL: mean(chunk  Q(s, z_t))
+    # -------------------------------------------------------------------------
+    def _chunkify_latent(self, z: th.Tensor) -> th.Tensor:
+        """
+        z: (B, z_dim)
+        return: (B, T, z_step_dim)
+        """
+        B = z.shape[0]
+        return z.view(B, self.diffusion_act_chunk, self.latent_step_dim)
+
+    def _q_from_chunk_latent(
+        self,
+        s: th.Tensor,
+        z_full: th.Tensor,
+        use_target: bool = False,
+    ) -> th.Tensor:
+        """
+        Q_chunk(s, z_full) = mean_t Q(s, z_t)
+
+        s:      (B, obs_dim)
+        z_full: (B, z_dim) = (B, T * z_step_dim)
+        return: (B,)
+        """
+        B = s.shape[0]
+        z_chunk = self._chunkify_latent(z_full)  # (B, T, z_step_dim)
+
+        q_all = []
+        for t in range(self.diffusion_act_chunk):
+            z_t = z_chunk[:, t, :]  # (B, z_step_dim)
+            q_t = self.policy.q_forward(s, z_t, use_target=use_target)  # (B,)
+            q_all.append(q_t.unsqueeze(-1))  # (B, 1)
+
+        q_all = th.cat(q_all, dim=-1)   # (B, T)
+        q_mean = q_all.mean(dim=-1)     # (B,)
+        return q_mean
+
 
     # -------------------------------------------------------------------------
     # Phase Detection
@@ -152,18 +198,18 @@ class FQL(OffPolicyAlgorithm):
     # -------------------------------------------------------------------------
     # Training Loop (Offline/Online Split)
     # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Training Loop (Offline/Online Split)
+    # -------------------------------------------------------------------------
     def train(self, gradient_steps: int, batch_size: int = 256) -> None:
         self.policy.set_training_mode(True)
 
-        # Freeze anchor model at offline→online transition
         if self._should_freeze_anchor():
             self._freeze_anchor_model()
             self._print_phase_transition()
 
-        # Statistics collection
         q_losses, flow_losses, distill_losses = [], [], []
         q_values, target_q_values = [], []
-        delta_norms, reg_values = [], []
 
         for step in range(gradient_steps):
             rb = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
@@ -172,75 +218,52 @@ class FQL(OffPolicyAlgorithm):
             r = th.as_tensor(rb.rewards, device=self.device, dtype=th.float32).squeeze(-1)
             d = th.as_tensor(rb.dones, device=self.device, dtype=th.float32).squeeze(-1)
 
-            # ===== CRITIC UPDATE (Both phases) =====
+            # ===== CRITIC UPDATE (chunk-aware) =====
+            # full latent z (B, z_dim)
             z = th.randn(batch_size, self.policy.z_dim, device=self.device)
-            q_pred = self.policy.q_forward(s, z)
-            
+
+            # 🔥 여기서 바로 q_forward(s, z) 쓰지 말고, chunk 평균 Q 사용
+            q_pred = self._q_from_chunk_latent(s, z, use_target=False)
+
             with th.no_grad():
                 z2 = th.randn(batch_size, self.policy.z_dim, device=self.device)
-                
-                # if self._is_offline_phase():
-                #     # Offline: use current flow model for TD target
-                #     z2p = self.policy.flow_forward(s2, z2)
-                # else:
-                #     # Online: use FROZEN ANCHOR for stable TD target
-                #     # This prevents critic from adapting to the changing student policy
-                #     z2p = self._forward_anchor(s2, z2)
-                z2p = self.policy.flow_forward(s2, z2)
-                
-                target_q = self.policy.q_forward(s2, z2p, use_target=True)
+                z2p = self.policy.flow_forward(s2, z2)  # (B, z_dim)
+                target_q = self._q_from_chunk_latent(s2, z2p, use_target=True)
+
                 target_q = th.clamp(target_q, -100, 100)
                 y = r + (1 - d) * self.gamma * target_q
                 y = th.clamp(y, -100, 100)
-            
+
             loss_q = F.smooth_l1_loss(q_pred, y)
-            
+
             self.policy.q_optimizer.zero_grad(set_to_none=True)
             loss_q.backward()
             th.nn.utils.clip_grad_norm_(self.policy.q_net.parameters(), max_norm=1.0)
             self.policy.q_optimizer.step()
-            
+
             q_losses.append(loss_q.item())
             q_values.append(q_pred.mean().item())
             target_q_values.append(target_q.mean().item())
 
-            # ===== FLOW/ACTOR UPDATE (Phase-dependent) =====
+            # ===== FLOW/ACTOR UPDATE =====
             if self._is_offline_phase():
-                # OFFLINE: Train flow model with Q-maximization
                 loss_flow = self._offline_flow_update(s, batch_size)
                 flow_losses.append(loss_flow.item())
-                
             else:
-                # ONLINE: Distillation from frozen anchor
                 loss_distill = self._online_distillation_update(s, batch_size)
                 distill_losses.append(loss_distill.item())
 
-            # Target network update
             if step % self.target_update_interval == 0:
                 self.policy.update_target_network(self.tau)
 
-            # Debug logging with progress bar
             if step % 100 == 0 and self.verbose > 0:
                 self._print_training_status(
-                    step, loss_q, 
+                    step, loss_q,
                     flow_losses[-1] if flow_losses else None,
                     distill_losses[-1] if distill_losses else None,
-                    q_values[-1]
+                    q_values[-1],
                 )
 
-        # Logging
-        self._n_updates += gradient_steps
-        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        self.logger.record("train/q_loss", np.mean(q_losses))
-        self.logger.record("train/q_value", np.mean(q_values))
-        self.logger.record("train/target_q_value", np.mean(target_q_values))
-        
-        if self._is_offline_phase():
-            self.logger.record("train/flow_loss", np.mean(flow_losses))
-            self.logger.record("train/phase", 0)  # 0 = offline
-        else:
-            self.logger.record("train/distill_loss", np.mean(distill_losses))
-            self.logger.record("train/phase", 1)  # 1 = online
 
     # -------------------------------------------------------------------------
     # Offline Flow Update
@@ -252,7 +275,7 @@ class FQL(OffPolicyAlgorithm):
         
         z = th.randn(batch_size, self.policy.z_dim, device=self.device)
         zp = self.policy.flow_forward(s, z)
-        qv = self.policy.q_forward(s, zp)
+        qv = self._q_from_chunk_latent(s, zp, use_target=False)
         
         # Regularization
         reg = (zp - z).pow(2).mean()
@@ -298,7 +321,7 @@ class FQL(OffPolicyAlgorithm):
         with th.no_grad():
             zp_anchor = self._forward_anchor(s, z)
 
-        qv = self.policy.q_forward(s, zp_student)
+        qv = self._q_from_chunk_latent(s, zp_student, use_target=False)
         denom = qv.abs().mean().detach() + 1e-6
         qv_normalized = qv / denom
         loss_q = (-qv_normalized).mean()
@@ -472,14 +495,14 @@ class FQL(OffPolicyAlgorithm):
     # Learning Wrapper
     # -------------------------------------------------------------------------
     def learn(
-        self: SelfFQL,
+        self: SelfCKFQL,
         total_timesteps: int,
         callback: MaybeCallback = None,
         log_interval: int = 4,
         tb_log_name: str = "FQL",
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
-    ) -> SelfFQL:
+    ) -> SelfCKFQL:
         # Print initial training info
         self._print_training_info(total_timesteps)
         

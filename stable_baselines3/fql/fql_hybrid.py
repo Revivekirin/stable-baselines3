@@ -173,26 +173,24 @@ class FQL(OffPolicyAlgorithm):
             d = th.as_tensor(rb.dones, device=self.device, dtype=th.float32).squeeze(-1)
 
             # ===== CRITIC UPDATE (Both phases) =====
-            z = th.randn(batch_size, self.policy.z_dim, device=self.device)
-            q_pred = self.policy.q_forward(s, z)
-            
+            actions = th.as_tensor(rb.actions, device=self.device, dtype=th.float32)
+
+            q_pred = self.policy.q_forward(s, actions)   # Q(s,a)
+
             with th.no_grad():
                 z2 = th.randn(batch_size, self.policy.z_dim, device=self.device)
-                
-                # if self._is_offline_phase():
-                #     # Offline: use current flow model for TD target
-                #     z2p = self.policy.flow_forward(s2, z2)
-                # else:
-                #     # Online: use FROZEN ANCHOR for stable TD target
-                #     # This prevents critic from adapting to the changing student policy
-                #     z2p = self._forward_anchor(s2, z2)
-                z2p = self.policy.flow_forward(s2, z2)
-                
-                target_q = self.policy.q_forward(s2, z2p, use_target=True)
+                w2 = self.policy.flow_forward(s2, z2)               
+                w2 = th.clamp(w2, -5, 5)
+                w2_input = w2.view(batch_size, self.diffusion_act_chunk, self.diffusion_act_dim)
+
+                a2 = self.diffusion_policy(s2, w2_input, return_numpy=False)
+                a2 = a2.view(batch_size, self.diffusion_act_chunk * self.diffusion_act_dim)
+
+                target_q = self.policy.q_forward(s2, a2, use_target=True)
                 target_q = th.clamp(target_q, -100, 100)
                 y = r + (1 - d) * self.gamma * target_q
                 y = th.clamp(y, -100, 100)
-            
+
             loss_q = F.smooth_l1_loss(q_pred, y)
             
             self.policy.q_optimizer.zero_grad(set_to_none=True)
@@ -246,65 +244,69 @@ class FQL(OffPolicyAlgorithm):
     # Offline Flow Update
     # -------------------------------------------------------------------------
     def _offline_flow_update(self, s: th.Tensor, batch_size: int) -> th.Tensor:
-        """Offline phase: Train flow model to maximize Q-values"""
+        # Q -> fix, flow-> update
         for p in self.policy.q_net.parameters():
             p.requires_grad_(False)
-        
+
         z = th.randn(batch_size, self.policy.z_dim, device=self.device)
-        zp = self.policy.flow_forward(s, z)
-        qv = self.policy.q_forward(s, zp)
-        
-        # Regularization
-        reg = (zp - z).pow(2).mean()
-        
-        # Q-maximization with regularization
+        w = self.policy.flow_forward(s, z)               # flow(s,z)
+        w = th.clamp(w, -5, 5)
+        w_input = w.view(batch_size, self.diffusion_act_chunk, self.diffusion_act_dim)
+
+        a = self.diffusion_policy(s, w_input, return_numpy=False)
+        a = a.view(batch_size, self.diffusion_act_chunk * self.diffusion_act_dim)
+
+        qv = self.policy.q_forward(s, a)                 # Q(s,a)
+
+        # regularization on latent movement
+        reg = (w - z).pow(2).mean()
+
         denom = qv.abs().mean().detach() + 1e-6
         qv_normalized = qv / denom
         loss_flow = (-qv_normalized).mean() + self.policy.alpha * reg
-        
+
         self.policy.flow_optimizer.zero_grad(set_to_none=True)
         loss_flow.backward()
         th.nn.utils.clip_grad_norm_(self.policy.flow_net.parameters(), max_norm=0.5)
         self.policy.flow_optimizer.step()
-        
+
         for p in self.policy.q_net.parameters():
             p.requires_grad_(True)
-        
+
         return loss_flow
+
 
     # -------------------------------------------------------------------------
     # Online Distillation Update
     # -------------------------------------------------------------------------
     def _online_distillation_update(self, s: th.Tensor, batch_size: int) -> th.Tensor:
-        """
-        Online phase:
-          - actor(flow)도 Q-gradient를 타게 만들고
-          - anchor는 regularizer로만 사용
-
-        Loss:
-          L = -lambda_Q * Q(s, f_theta(s,z))_norm
-              + distillation_coef * || f_theta(s,z) - f_anchor(s,z) ||^2
-        """
         assert self.anchor_flow_net is not None, "Anchor model not frozen!"
         
         for p in self.policy.q_net.parameters():
             p.requires_grad_(False)
 
         z = th.randn(batch_size, self.policy.z_dim, device=self.device)
-        
-        # Current flow_net acts as "student"
-        zp_student = self.policy.flow_forward(s, z)
-        # Frozen anchor_flow_net acts as "teacher"
-        with th.no_grad():
-            zp_anchor = self._forward_anchor(s, z)
 
-        qv = self.policy.q_forward(s, zp_student)
+        # student flow
+        w_student = self.policy.flow_forward(s, z)
+        w_student = th.clamp(w_student, -5, 5)
+        w_student_in = w_student.view(batch_size, self.diffusion_act_chunk, self.diffusion_act_dim)
+
+        # teacher(flow anchor)
+        with th.no_grad():
+            w_anchor = self._forward_anchor(s, z)
+
+        # decode student to action
+        a_student = self.diffusion_policy(s, w_student_in, return_numpy=False)
+        a_student = a_student.view(batch_size, self.diffusion_act_chunk * self.diffusion_act_dim)
+
+        qv = self.policy.q_forward(s, a_student)
         denom = qv.abs().mean().detach() + 1e-6
         qv_normalized = qv / denom
         loss_q = (-qv_normalized).mean()
-        
-        # Distillation loss: keep student close to teacher
-        loss_distill = F.mse_loss(zp_student, zp_anchor) 
+
+        # distillation in latent space
+        loss_distill = F.mse_loss(w_student, w_anchor)
 
         loss_flow = self.online_q_coef * loss_q + self.distillation_coef * loss_distill
 
@@ -312,11 +314,12 @@ class FQL(OffPolicyAlgorithm):
         loss_flow.backward()
         th.nn.utils.clip_grad_norm_(self.policy.flow_net.parameters(), max_norm=0.5)
         self.policy.flow_optimizer.step()
-        
+
         for p in self.policy.q_net.parameters():
             p.requires_grad_(True)
 
         return loss_flow
+
 
     # -------------------------------------------------------------------------
     # Anchor Model Management

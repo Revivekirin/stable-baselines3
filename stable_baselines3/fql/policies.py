@@ -1,4 +1,4 @@
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, Dict, Type
 
 import torch as th
 from gymnasium import spaces
@@ -48,7 +48,293 @@ class FlowNetwork(nn.Module):
         return z + delta_z
 
 
-# --- New: LatentFQLPolicy ------------------------------------
+class CKLatentFQLPolicy(BasePolicy):
+    """
+    Chunk-aware Latent FQL Policy for frozen DPPO / diffusion decoder.
+
+    - 전체 latent: z_full ∈ R^{z_dim}
+    - chunk_len: T (chunk 길이)
+    - per-step latent: z_step_dim = z_dim // chunk_len
+    - Flow:   f_theta(s, z_full) -> z_full'
+    - Critic: Q(s, z_step) on each step, then FQL 쪽에서 mean_t Q(s, z_t) 사용
+
+    FQL(chunk) 쪽에서는:
+        z_full -> (B, T, z_step_dim) 로 reshape 후
+        Q_chunk(s, z_full) = mean_t Q(s, z_t)
+    """
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Box,
+        lr_schedule: Schedule,
+        net_arch: Optional[Union[list[int], Dict[str, list[int]]]] = None,
+        activation_fn: Type[nn.Module] = nn.Tanh,
+        z_dim: int = 32,
+        alpha: float = 0.1,
+        chunk_len: int = 4,  
+        features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
+        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        normalize_images: bool = True,
+        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        share_features_extractor: bool = False, 
+        post_linear_modules: Optional[list[Type[nn.Module]]] = None,
+        features_dim: Optional[int] = None,  
+        flow_steps: int = 1,
+        flow_step_size: float = 1.0,
+    ):
+        super().__init__(
+            observation_space=observation_space,
+            action_space=action_space,
+            features_extractor_class=features_extractor_class,
+            features_extractor_kwargs=features_extractor_kwargs,
+            optimizer_class=optimizer_class,
+            optimizer_kwargs=optimizer_kwargs,
+            squash_output=False,
+            normalize_images=normalize_images,
+        )
+        self.z_dim = int(z_dim)           
+        self.chunk_len = int(chunk_len)   
+        assert self.chunk_len >= 1, "chunk_len must be >= 1"
+        assert self.z_dim % self.chunk_len == 0, \
+            f"z_dim ({self.z_dim}) must be divisible by chunk_len ({self.chunk_len})"
+
+        self.z_step_dim = self.z_dim // self.chunk_len  # per-step latent dim
+        self.alpha = alpha
+        self.activation_fn = activation_fn
+        self.post_linear_modules = post_linear_modules or []
+        self._explicit_features_dim = features_dim
+
+        if net_arch is None:
+            net_arch = [256, 256]
+        if isinstance(net_arch, dict):
+            self.flow_arch = net_arch.get("pi", [256, 256])
+            self.q_arch = net_arch.get("qf", [256, 256])
+        else:
+            self.flow_arch = net_arch
+            self.q_arch = net_arch
+        self.net_arch = net_arch
+
+        self.flow_steps = flow_steps
+        self.flow_step_size = flow_step_size
+
+        self._build_networks(lr_schedule)
+
+    # ------------------------------------------------------------------
+    # Network builders
+    # ------------------------------------------------------------------
+    def _build_networks(self, lr_schedule: Schedule) -> None:
+        # Feature extractor
+        fe_kwargs = self.features_extractor_kwargs or {}
+        self.features_extractor = self.features_extractor_class(
+            self.observation_space, **fe_kwargs
+        ).to(self.device)
+
+        if self._explicit_features_dim is not None:
+            self.features_dim = int(self._explicit_features_dim)
+        else:
+            assert hasattr(self.features_extractor, "features_dim"), \
+                "features_extractor must define .features_dim"
+            self.features_dim = int(self.features_extractor.features_dim)
+
+        # ---------- Flow network: features + full z_dim ----------
+        flow_in_dim = self.features_dim + self.z_dim
+        flow_mlp = nn.Sequential(
+            *create_mlp(
+                flow_in_dim,
+                self.z_dim,
+                self.flow_arch,
+                self.activation_fn,
+                post_linear_modules=self.post_linear_modules,
+            )
+        )
+        # last layer small init
+        if len(flow_mlp) > 0 and isinstance(flow_mlp[-1], nn.Linear):
+            nn.init.uniform_(flow_mlp[-1].weight, -1e-3, 1e-3)
+            nn.init.zeros_(flow_mlp[-1].bias)
+
+        self.flow_net = FlowNetwork(flow_mlp).to(self.device)
+
+        # ---------- Q network: features + per-step z_step_dim ----------
+        q_in_dim = self.features_dim + self.z_step_dim
+        self.q_net = nn.Sequential(
+            *create_mlp(
+                q_in_dim,
+                1,
+                self.q_arch,
+                self.activation_fn,
+                post_linear_modules=self.post_linear_modules,
+            )
+        ).to(self.device)
+
+        # Q-network last layer init
+        if len(self.q_net) > 0 and isinstance(self.q_net[-1], nn.Linear):
+            nn.init.uniform_(self.q_net[-1].weight, -3e-3, 3e-3)
+            nn.init.uniform_(self.q_net[-1].bias, -3e-3, 3e-3)
+
+        # Target Q network (동일 구조, hard copy)
+        self.q_target = nn.Sequential(
+            *create_mlp(
+                q_in_dim,
+                1,
+                self.q_arch,
+                self.activation_fn,
+                post_linear_modules=self.post_linear_modules,
+            )
+        ).to(self.device)
+        self.q_target.load_state_dict(self.q_net.state_dict())
+        self.q_target.eval()
+        for p in self.q_target.parameters():
+            p.requires_grad_(False)
+
+        # ---------- Optimizers ----------
+        opt_kwargs = self.optimizer_kwargs or {}
+        self.flow_optimizer = self.optimizer_class(
+            self.flow_net.parameters(),
+            lr=lr_schedule(1),
+            **opt_kwargs,
+        )
+        self.q_optimizer = self.optimizer_class(
+            self.q_net.parameters(),
+            lr=lr_schedule(1),
+            **opt_kwargs,
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _param_device(self) -> th.device:
+        return next(self.flow_net.parameters()).device
+
+    # ------------------------------------------------------------------
+    # Flow forward: s, z_full -> z_full'
+    # ------------------------------------------------------------------
+    def flow_forward(self, obs: th.Tensor, z_full: th.Tensor) -> th.Tensor:
+        """
+        Flow forward pass: s, z_full -> z_full'
+
+        Args:
+            obs:    (B, obs_dim)
+            z_full: (B, z_dim)
+        Returns:
+            z_full': (B, z_dim)
+        """
+        dev = self._param_device()
+        if not isinstance(obs, th.Tensor):
+            obs = th.as_tensor(obs, device=dev, dtype=th.float32)
+        else:
+            obs = obs.to(dev)
+        if not isinstance(z_full, th.Tensor):
+            z_full = th.as_tensor(z_full, device=dev, dtype=th.float32)
+        else:
+            z_full = z_full.to(dev)
+
+        with th.no_grad():
+            feat = self.extract_features(obs, self.features_extractor)
+
+        z_cur = z_full
+        for _ in range(self.flow_steps):
+            delta = self.flow_net(feat, z_cur)
+            z_cur = z_cur + self.flow_step_size * delta
+
+        return z_cur
+
+    # ------------------------------------------------------------------
+    # Q forward: s, z_step -> Q(s, z_step)
+    #  - 여기서 z는 per-step latent (z_step_dim) 이라고 가정
+    # ------------------------------------------------------------------
+    def q_forward(
+        self,
+        obs: PyTorchObs,
+        z_step: th.Tensor,
+        use_target: bool = False,
+    ) -> th.Tensor:
+        """
+        Critic forward: s, z_step -> Q(s, z_step)
+
+        obs:    (B, obs_dim)
+        z_step: (B, z_step_dim)
+        return: (B,)
+        """
+        dev = self._param_device()
+        if not isinstance(obs, th.Tensor):
+            obs = th.as_tensor(obs, device=dev, dtype=th.float32)
+        else:
+            obs = obs.to(dev)
+        if not isinstance(z_step, th.Tensor):
+            z_step = th.as_tensor(z_step, device=dev, dtype=th.float32)
+        else:
+            z_step = z_step.to(dev)
+
+        feat = self.extract_features(obs, self.features_extractor)  # grad O.K.
+        q_in = th.cat([feat, z_step], dim=-1)  # (B, features_dim + z_step_dim)
+
+        if use_target:
+            with th.no_grad():
+                q_val = self.q_target(q_in).squeeze(-1)
+        else:
+            q_val = self.q_net(q_in).squeeze(-1)
+        return q_val
+
+    # ------------------------------------------------------------------
+    # Target network update
+    # ------------------------------------------------------------------
+    def update_target_network(self, tau: float = 1.0) -> None:
+        """
+        Polyak update: θ_target ← τ θ + (1-τ) θ_target
+        tau=1.0이면 hard update.
+        """
+        for param, target_param in zip(self.q_net.parameters(), self.q_target.parameters()):
+            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+
+    # ------------------------------------------------------------------
+    # SB3 compatibility stubs
+    # ------------------------------------------------------------------
+    def forward(self, obs: PyTorchObs, deterministic: bool = False) -> th.Tensor:
+        raise NotImplementedError("CKLatentFQLPolicy does not provide direct actions.")
+
+    def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> th.Tensor:
+        raise NotImplementedError("Use flow_forward + external decoder for actions.")
+
+    # ------------------------------------------------------------------
+    # Training / eval mode toggle
+    # ------------------------------------------------------------------
+    def set_training_mode(self, mode: bool) -> None:
+        self.training = mode
+        self.features_extractor.train(mode)
+        self.flow_net.train(mode)
+        self.q_net.train(mode)
+        self.q_target.eval()  # target은 항상 eval
+
+    # ------------------------------------------------------------------
+    # Save/load support
+    # ------------------------------------------------------------------
+    def _get_constructor_parameters(self) -> Dict[str, Any]:
+        data = super()._get_constructor_parameters()
+        data.update(
+            dict(
+                lr_schedule=self._dummy_schedule,
+                net_arch=self.net_arch,
+                activation_fn=self.activation_fn,
+                z_dim=self.z_dim,
+                alpha=self.alpha,
+                chunk_len=self.chunk_len,
+                features_extractor_class=self.features_extractor_class,
+                features_extractor_kwargs=self.features_extractor_kwargs,
+                normalize_images=self.normalize_images,
+                optimizer_class=self.optimizer_class,
+                optimizer_kwargs=self.optimizer_kwargs,
+                post_linear_modules=self.post_linear_modules,
+                features_dim=self.features_dim,
+                flow_steps=self.flow_steps,
+                flow_step_size=self.flow_step_size,
+            )
+        )
+        return data
+
+
+# --- LatentFQLPolicy ------------------------------------
 class LatentFQLPolicy(BasePolicy):
     """
     Policy for latent-only FQL on frozen DPPO:
@@ -332,6 +618,7 @@ class LatentFQLPolicy(BasePolicy):
 
 # ===== Aliases for convenience =====
 MlpLatentFQLPolicy = LatentFQLPolicy
+MlpCKLatentFQLPolicy = CKLatentFQLPolicy
 
 
 # ===== CNN/MultiInput variants (필요시) =====
